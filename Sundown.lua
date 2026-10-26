@@ -480,7 +480,7 @@ function UI:CreateWindow(cfg)
             w.Label = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
             w.Box = uiNew("Square", { Filled = false, Thickness = 1, Color = grad(0.5), Transparency = 1 }, 3, w.all)
             w.Check = uiNew("Square", { Filled = true, Color = grad(0.1), Transparency = 1 }, 4, w.all)
-            self._widgets[#self._widgets + 1] = w
+            window._widgets[#window._widgets + 1] = w
             return w
         end
 
@@ -498,7 +498,7 @@ function UI:CreateWindow(cfg)
                 w.Strips[i] = uiNew("Square", { Filled = true, Transparency = 1 }, 3, w.all)
             end
             w.Value = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
-            self._widgets[#self._widgets + 1] = w
+            window._widgets[#window._widgets + 1] = w
             return w
         end
 
@@ -514,7 +514,7 @@ function UI:CreateWindow(cfg)
             w.Hover = uiNew("Square", { Filled = true, Color = Color3.fromRGB(150, 60, 200), Transparency = 0.3 }, 1, w.all)
             w.Label = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
             w.Value = uiNew("Text", { Size = 16 }, 3, w.all)
-            self._widgets[#self._widgets + 1] = w
+            window._widgets[#window._widgets + 1] = w
             return w
         end
 
@@ -523,7 +523,7 @@ function UI:CreateWindow(cfg)
             local w = { kind = "button", tab = t, row = r, label = label, all = {}, shown = false, callback = callback }
             w.Hover = uiNew("Square", { Filled = true, Color = Color3.fromRGB(150, 60, 200), Transparency = 0.3 }, 1, w.all)
             w.Label = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
-            self._widgets[#self._widgets + 1] = w
+            window._widgets[#window._widgets + 1] = w
             return w
         end
 
@@ -536,7 +536,7 @@ function UI:CreateWindow(cfg)
             w.Hover = uiNew("Square", { Filled = true, Color = Color3.fromRGB(150, 60, 200), Transparency = 0.3 }, 1, w.all)
             w.Label = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
             w.Value = uiNew("Text", { Size = 16 }, 3, w.all)
-            self._widgets[#self._widgets + 1] = w
+            window._widgets[#window._widgets + 1] = w
             return w
         end
 
@@ -546,7 +546,7 @@ function UI:CreateWindow(cfg)
             w.Hover = uiNew("Square", { Filled = true, Color = Color3.fromRGB(150, 60, 200), Transparency = 0.3 }, 1, w.all)
             w.Label = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
             w.SepText = uiNew("Text", { Size = 12, Center = true }, 3, w.all)
-            self._widgets[#self._widgets + 1] = w
+            window._widgets[#window._widgets + 1] = w
             return w
         end
 
