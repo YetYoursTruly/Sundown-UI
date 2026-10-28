@@ -89,6 +89,16 @@ local Settings = {
     MenuTextSize = 16,
 }
 
+local Whitelist = {
+	8905539728,
+	5179198050,
+}
+
+local WhitelistSet = {}
+for _, id in ipairs(Whitelist) do
+    WhitelistSet[id] = true
+end
+
 local BIND_KEYS = {
     "BindMenu", "BindUnload", "BindFly", "BindFullbright",
     "BindClickTP", "BindFlyUp", "BindFlyDown", "BindFlyBoost",
@@ -1372,6 +1382,11 @@ end
 -- Aimbot
 ----------------------------------------------------------------------
 local AimAll = {}
+
+local function IsWhitelisted(player)
+    return player ~= nil and WhitelistSet[player.UserId] == true
+end
+
 local function aimNew(class, props)
     local d = Drawing.new(class)
     for k, v in pairs(props) do d[k] = v end
@@ -1466,14 +1481,15 @@ local function aimStep(dt)
     local best
     local myChar = LocalPlayer.Character
 
-    if Settings.Targets ~= "NPCs Only" then
-        for player in pairs(Tracked) do
-            local blocked = Settings.TeamCheck and player.Team ~= nil and player.Team == LocalPlayer.Team
-            if not blocked then
-                best = consider(player.Character, origin, best)
-            end
-        end
-    end
+	if Settings.Targets ~= "NPCs Only" then
+    	for player in pairs(Tracked) do
+        	local blocked = (Settings.TeamCheck and player.Team ~= nil and player.Team == LocalPlayer.Team)
+            	or IsWhitelisted(player)
+        	if not blocked then
+            	best = consider(player.Character, origin, best)
+        	end
+    	end
+	end
     if Settings.Targets ~= "Players Only" then
         for model in pairs(NPCModels) do
             if model.Parent and model ~= myChar and not Players:GetPlayerFromCharacter(model) then
@@ -1709,19 +1725,20 @@ Conns[#Conns + 1] = RunService.RenderStepped:Connect(function(dt)
     local showPlayers = Settings.Targets ~= "NPCs Only"
     local showNPCs = Settings.Targets ~= "Players Only"
 
-    if showPlayers then
-        for player in pairs(Tracked) do
-            local char = player.Character
-            local hum, root, dist, pos = locate(char)
-            local s = Sets[player]
-            local blocked = Settings.TeamCheck and player.Team ~= nil and player.Team == LocalPlayer.Team
-            if hum and not blocked then
-                s = s or acquire(player)
-                draw(s, char, hum, root, dist, pos, player.DisplayName)
-            elseif s then
-                hideSet(s)
-            end
-        end
+	if showPlayers then
+    	for player in pairs(Tracked) do
+        	local char = player.Character
+        	local hum, root, dist, pos = locate(char)
+        	local s = Sets[player]
+        	local blocked = (Settings.TeamCheck and player.Team ~= nil and player.Team == LocalPlayer.Team)
+            	or IsWhitelisted(player)
+        	if hum and not blocked then
+            	s = s or acquire(player)
+            	draw(s, char, hum, root, dist, pos, player.DisplayName)
+        	elseif s then
+            	hideSet(s)
+        	end
+    	end
     else
         for player in pairs(Tracked) do
             local s = Sets[player]
