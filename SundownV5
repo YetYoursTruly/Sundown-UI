@@ -1,0 +1,1764 @@
+--// SUNDOWN v5 - ESP + Aimbot + Fly/Teleport + Fullbright + FOV, resizable synthwave menu (Drawing API)
+--// Default keys: Insert = menu | End = unload | V = fly | (all rebindable in the KEYS tab)
+--// Fly: W/A/S/D move toward camera, Up/Down/Boost keys are rebindable
+--// Click Teleport: hold the Click TP key (default LeftControl) and left-click a spot
+--// Settings auto-save to  <executor workspace>/SUNDOWN/settings.json
+
+--!nocheck
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+
+-- Reload safety: unload any previous copy first (it saves its settings on the way out)
+if getgenv().UnloadESP then
+    pcall(getgenv().UnloadESP)
+end
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+----------------------------------------------------------------------
+-- Settings (also editable live through getgenv().ESPSettings)
+----------------------------------------------------------------------
+local Settings = {
+    Enabled = true,
+    TeamCheck = true,
+    Targets = "All Humanoids",  -- "Players Only", "NPCs Only", "All Humanoids"
+    MaxDistance = 2000,
+
+    Box = true,
+    BoxStyle = "Corner",     -- "Corner" or "Full"
+    BoxFill = true,
+    FillOpacity = 0.18,
+
+    Name = true,
+    Distance = true,
+    Tool = true,
+    TextSize = 15,
+
+    Health = true,
+    HealthText = true,
+
+    Tracers = true,
+    TracerOrigin = "Bottom", -- "Bottom", "Center", "Mouse"
+    HeadDot = true,
+
+    -- Aimbot
+    AimEnabled = false,
+    AimKey = "Right Mouse",  -- "Right Mouse", "Left Mouse", "Always On"
+    AimPart = "Head",        -- "Head", "Torso"
+    AimMethod = "Camera",    -- "Camera", "Mouse" (Mouse needs mousemoverel)
+    AimOrigin = "Mouse",     -- "Mouse", "Screen"
+    AimWallCheck = true,
+    AimShowFOV = true,
+    AimFOV = 150,
+    AimSmooth = 6,           -- 1 = instant snap, higher = softer
+
+    -- Movement
+    Fly = false,
+    FlySpeed = 60,
+    Noclip = false,
+    ClickTP = false,
+    TPTarget = "None",
+
+    -- World
+    Fullbright = false,
+    FBMode = "Default",      -- "Default" (Roblox default ambient) or "Bright" (pure white)
+    FBFog = true,            -- remove fog + Atmosphere while fullbright is on
+    FBSky = true,            -- hide Sky objects while fullbright is on
+
+    FOVEnabled = false,
+    CameraFOV = 70,
+    FOVMethod = "Camera",    -- "Camera" (smooth, works everywhere) or "ByteNet" (server remote)
+
+    -- Keybinds (KeyCode names, or "None")
+    BindMenu = "Insert",
+    BindUnload = "End",
+    BindFly = "V",
+    BindFullbright = "None",
+    BindClickTP = "LeftControl",
+    BindFlyUp = "Space",
+    BindFlyDown = "LeftControl",
+    BindFlyBoost = "LeftShift",
+
+    -- Text
+    Font = "UI",            -- "UI", "System", "Plex", "Monospace"
+    MenuTextSize = 16,
+}
+
+local BIND_KEYS = {
+    "BindMenu", "BindUnload", "BindFly", "BindFullbright",
+    "BindClickTP", "BindFlyUp", "BindFlyDown", "BindFlyBoost",
+}
+
+local Defaults = {}
+for k, v in pairs(Settings) do Defaults[k] = v end
+
+----------------------------------------------------------------------
+-- Save / load (folder: SUNDOWN)
+----------------------------------------------------------------------
+local FOLDER = "SUNDOWN"
+local FILE = FOLDER .. "/settings.json"
+local SKIP = { Fly = true, Noclip = true, TPTarget = true } -- runtime state, never persisted
+
+local canFS = type(writefile) == "function" and type(readfile) == "function"
+    and type(makefolder) == "function" and type(isfolder) == "function" and type(isfile) == "function"
+
+local savedUI
+local dirtyAt
+local saveSettings -- assigned after the UI table exists
+
+local function ensureFolder()
+    if not canFS then return false end
+    local ok = pcall(function()
+        if not isfolder(FOLDER) then makefolder(FOLDER) end
+    end)
+    return ok
+end
+
+local function loadSettings()
+    if not ensureFolder() then return end
+    pcall(function()
+        if not isfile(FILE) then return end
+        local data = HttpService:JSONDecode(readfile(FILE))
+        if type(data) ~= "table" then return end
+        for k, v in pairs(data) do
+            if k ~= "__ui" and not SKIP[k] and Settings[k] ~= nil and type(Settings[k]) == type(v) then
+                Settings[k] = v
+            end
+        end
+        if type(data.__ui) == "table" then savedUI = data.__ui end
+    end)
+end
+
+loadSettings()
+
+local function markDirty()
+    dirtyAt = os.clock()
+end
+
+----------------------------------------------------------------------
+-- Keybind helpers
+----------------------------------------------------------------------
+local function keyLabel(name)
+    return name == "None" and "-" or name
+end
+
+local function validKeyName(name)
+    if name == "None" then return true end
+    local ok = pcall(function() return Enum.KeyCode[name].Value end)
+    return ok
+end
+
+for _, k in ipairs(BIND_KEYS) do
+    if type(Settings[k]) ~= "string" or not validKeyName(Settings[k]) then
+        Settings[k] = Defaults[k]
+    end
+end
+
+local function pressed(input, bindKey)
+    local b = Settings[bindKey]
+    return b ~= "None" and input.KeyCode.Name == b
+end
+
+local function keyDown(bindKey)
+    local n = Settings[bindKey]
+    if n == "None" then return false end
+    local ok, kc = pcall(function() return Enum.KeyCode[n] end)
+    return ok and kc ~= nil and UserInputService:IsKeyDown(kc)
+end
+
+----------------------------------------------------------------------
+-- Text helpers (crisp text)
+----------------------------------------------------------------------
+local FONT_IDS = { UI = 0, System = 1, Plex = 2, Monospace = 3 }
+local FONT_NAMES = { "UI", "System", "Plex", "Monospace" }
+
+local function fontId()
+    local name = Settings.Font
+    if Drawing.Fonts and Drawing.Fonts[name] ~= nil then return Drawing.Fonts[name] end
+    return FONT_IDS[name] or 0
+end
+
+local BLACK = Color3.new(0, 0, 0)
+
+local function styleText(d)
+    pcall(function() d.Font = fontId() end)
+    pcall(function() d.Outline = true end)
+    pcall(function() d.OutlineColor = BLACK end)
+end
+
+-- Snap to whole pixels: fractional text coordinates make Drawing text look blurry
+local function P(x, y)
+    return Vector2.new(math.floor(x + 0.5), math.floor(y + 0.5))
+end
+
+local function tw(d)
+    local ok, b = pcall(function() return d.TextBounds.X end)
+    if ok and b and b > 0 then return b end
+    return #d.Text * d.Size * 0.55
+end
+
+----------------------------------------------------------------------
+-- Synthwave sunset palette
+----------------------------------------------------------------------
+local STOPS = {
+    { 0.00, Color3.fromRGB(255, 238, 110) },
+    { 0.16, Color3.fromRGB(255, 184, 60) },
+    { 0.32, Color3.fromRGB(255, 112, 80) },
+    { 0.48, Color3.fromRGB(255, 52, 140) },
+    { 0.64, Color3.fromRGB(214, 58, 214) },
+    { 0.80, Color3.fromRGB(136, 74, 255) },
+    { 1.00, Color3.fromRGB(56, 128, 255) },
+}
+
+local STEPS = 160
+local GRAD = table.create(STEPS)
+for i = 1, STEPS do
+    local t = (i - 1) / (STEPS - 1)
+    for s = 1, #STOPS - 1 do
+        local a, b = STOPS[s], STOPS[s + 1]
+        if t <= b[1] or s == #STOPS - 1 then
+            local u = math.clamp((t - a[1]) / (b[1] - a[1]), 0, 1)
+            u = u * u * (3 - 2 * u)
+            GRAD[i] = a[2]:Lerp(b[2], u)
+            break
+        end
+    end
+end
+
+local function grad(t)
+    return GRAD[math.floor(math.clamp(t, 0, 1) * (STEPS - 1) + 0.5) + 1]
+end
+
+local function gradAnim(t, offset)
+    local p = (t + offset) % 2
+    if p > 1 then p = 2 - p end
+    return grad(p)
+end
+
+local C0, C1 = grad(0), grad(1)
+
+----------------------------------------------------------------------
+-- ESP drawing pool
+----------------------------------------------------------------------
+local FILL_N, HP_N, TRACER_N = 10, 4, 8
+
+local function newDrawing(class, props, pool)
+    local d = Drawing.new(class)
+    if class == "Text" then styleText(d) end
+    for k, v in pairs(props) do
+        d[k] = v
+    end
+    d.Visible = false
+    pool[#pool + 1] = d
+    return d
+end
+
+local function newSet()
+    local all = {}
+    local s = { All = all, Fill = {}, Box = {}, HP = {}, Tracer = {}, Shown = false }
+
+    for i = 1, FILL_N do
+        s.Fill[i] = newDrawing("Square", { Filled = true, Thickness = 1 }, all)
+    end
+    for i = 1, 10 do
+        s.Box[i] = newDrawing("Line", { Thickness = 2 }, all)
+    end
+    s.Name = newDrawing("Text", { Center = true }, all)
+    s.Dist = newDrawing("Text", { Center = true }, all)
+    s.Tool = newDrawing("Text", { Center = true }, all)
+    s.HPBG = newDrawing("Line", { Thickness = 5, Color = BLACK, Transparency = 0.6 }, all)
+    for i = 1, HP_N do
+        s.HP[i] = newDrawing("Line", { Thickness = 3 }, all)
+    end
+    s.HPText = newDrawing("Text", {}, all)
+    for i = 1, TRACER_N do
+        s.Tracer[i] = newDrawing("Line", { Thickness = 1 }, all)
+    end
+    s.Head = newDrawing("Circle", { Filled = false, Thickness = 1, NumSides = 18 }, all)
+    return s
+end
+
+local function hideSet(s)
+    if not s.Shown then return end
+    s.Shown = false
+    for _, d in ipairs(s.All) do
+        d.Visible = false
+    end
+end
+
+local function freeSet(s)
+    for _, d in ipairs(s.All) do
+        d:Remove()
+    end
+end
+
+local Sets = {}
+local Tracked = {}
+local NPCModels = {}
+
+local function acquire(key)
+    local s = newSet()
+    Sets[key] = s
+    return s
+end
+
+local function release(key)
+    local s = Sets[key]
+    if s then
+        freeSet(s)
+        Sets[key] = nil
+    end
+end
+
+----------------------------------------------------------------------
+-- Targets: players + all humanoids
+----------------------------------------------------------------------
+local Conns = {}
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then Tracked[p] = true end
+end
+Conns[#Conns + 1] = Players.PlayerAdded:Connect(function(p)
+    if p ~= LocalPlayer then Tracked[p] = true end
+end)
+Conns[#Conns + 1] = Players.PlayerRemoving:Connect(function(p)
+    Tracked[p] = nil
+    release(p)
+end)
+
+local function registerHumanoid(h)
+    local model = h.Parent
+    if model and model:IsA("Model") then
+        NPCModels[model] = true
+    end
+end
+
+Conns[#Conns + 1] = workspace.DescendantAdded:Connect(function(d)
+    if d:IsA("Humanoid") then registerHumanoid(d) end
+end)
+Conns[#Conns + 1] = workspace.DescendantRemoving:Connect(function(d)
+    if d:IsA("Humanoid") then
+        local m = d.Parent
+        if m then
+            NPCModels[m] = nil
+            release(m)
+        end
+    end
+end)
+
+task.spawn(function()
+    local n = 0
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Humanoid") then registerHumanoid(d) end
+        n = n + 1
+        if n % 4000 == 0 then task.wait() end
+    end
+end)
+
+----------------------------------------------------------------------
+-- Field of view: smooth camera FOV (works in any game) or ByteNet remote
+----------------------------------------------------------------------
+local FOVRemote
+local lastFOV
+
+local function sendFOV(value, force)
+    value = math.clamp(math.round(value), 70, 120)
+    if not FOVRemote then return end
+    if not force and value == lastFOV then return end
+    lastFOV = value
+
+    local data = buffer.create(5)
+    buffer.writeu8(data, 0, 8)
+    buffer.writeu8(data, 1, value)
+    buffer.writeu8(data, 2, 0)
+    buffer.writeu8(data, 3, 0)
+    buffer.writeu8(data, 4, 0)
+    FOVRemote:FireServer(data, nil)
+end
+
+-- Only looked up; the packet is only ever sent when FOV Method is set to ByteNet
+task.spawn(function()
+    FOVRemote = ReplicatedStorage:WaitForChild("ByteNetReliable", 10)
+end)
+
+local fovState = { active = false, orig = 70 }
+
+local function fovStep(dt)
+    if Settings.FOVMethod == "ByteNet" then
+        if fovState.active then
+            Camera.FieldOfView = fovState.orig
+            fovState.active = false
+        end
+        if Settings.FOVEnabled then
+            sendFOV(Settings.CameraFOV)
+        elseif lastFOV and lastFOV ~= 70 then
+            sendFOV(70)
+        end
+        return
+    end
+
+    -- leftover from ByteNet mode
+    if lastFOV and lastFOV ~= 70 then sendFOV(70) end
+
+    local target
+    if Settings.FOVEnabled then
+        if not fovState.active then
+            fovState.active = true
+            fovState.orig = Camera.FieldOfView
+        end
+        target = Settings.CameraFOV
+    elseif fovState.active then
+        target = fovState.orig
+    else
+        return
+    end
+
+    -- exponential ease: smooth tween toward the target, and it re-asserts against games that reset FOV
+    local cur = Camera.FieldOfView
+    local nxt = cur + (target - cur) * (1 - math.exp(-dt * 10))
+    if math.abs(target - nxt) < 0.05 then
+        nxt = target
+        if not Settings.FOVEnabled then fovState.active = false end
+    end
+    Camera.FieldOfView = nxt
+end
+
+----------------------------------------------------------------------
+-- Fullbright: default ambient, no fog, sky hidden (nothing is ever deleted)
+----------------------------------------------------------------------
+local DEFAULT_AMBIENT = Color3.fromRGB(70, 70, 70) -- Roblox default Ambient / OutdoorAmbient
+local NO_FOG_END = 1e7
+
+local FB = { active = false, ambient = nil, outdoor = nil, clockTime = nil, fogStart = nil, fogEnd = nil, fogApplied = false, shadows = nil, hidden = {} }
+
+local function fbRestoreFog()
+    if FB.fogApplied then
+        Lighting.FogStart = FB.fogStart
+        Lighting.FogEnd = FB.fogEnd
+        FB.fogApplied = false
+    end
+end
+
+local function fbReconcileObjects()
+    -- hide matching objects by un-parenting them (kept in memory so they can be put back)
+    for _, o in ipairs(Lighting:GetChildren()) do
+        if (Settings.FBSky and o:IsA("Sky")) or (Settings.FBFog and o:IsA("Atmosphere")) then
+            FB.hidden[o] = o.Parent
+            o.Parent = nil
+        end
+    end
+    -- put back anything that is no longer wanted hidden
+    for o, parent in pairs(FB.hidden) do
+        local want = (o:IsA("Sky") and Settings.FBSky) or (o:IsA("Atmosphere") and Settings.FBFog)
+        if not want then
+            pcall(function() o.Parent = parent end)
+            FB.hidden[o] = nil
+        end
+    end
+end
+
+local function fullbrightStep()
+    if Settings.Fullbright then
+		Lighting.ClockTime = 12
+        if not FB.active then
+            FB.active = true
+			FB.clockTime = Lighting.ClockTime
+            FB.ambient, FB.outdoor = Lighting.Ambient, Lighting.OutdoorAmbient
+            FB.shadows = Lighting.GlobalShadows
+        end
+        Lighting.GlobalShadows = false
+
+        local c = Settings.FBMode == "Bright" and Color3.new(1, 1, 1) or DEFAULT_AMBIENT
+        if Lighting.Ambient ~= c then Lighting.Ambient = c end
+        if Lighting.GlobalShadows ~= false then Lighting.GlobalShadows = false end
+        if Lighting.OutdoorAmbient ~= c then Lighting.OutdoorAmbient = c end
+
+        if Settings.FBFog then
+            if not FB.fogApplied then
+                FB.fogStart, FB.fogEnd = Lighting.FogStart, Lighting.FogEnd
+                FB.fogApplied = true
+            end
+            if Lighting.FogEnd ~= NO_FOG_END then Lighting.FogEnd = NO_FOG_END end
+        else
+            fbRestoreFog()
+        end
+
+        fbReconcileObjects()
+    elseif FB.active then
+        FB.active = false
+		
+		if FB.clockTime ~= nil then
+    		Lighting.ClockTime = FB.clockTime
+		end
+
+        if FB.ambient then Lighting.Ambient = FB.ambient end
+        if FB.outdoor then Lighting.OutdoorAmbient = FB.outdoor end
+        if FB.shadows ~= nil then Lighting.GlobalShadows = FB.shadows end
+        fbRestoreFog()
+        for o, parent in pairs(FB.hidden) do
+            pcall(function() o.Parent = parent end)
+            FB.hidden[o] = nil
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- Movement: fly, noclip, teleport
+----------------------------------------------------------------------
+local function getChar()
+    local c = LocalPlayer.Character
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    local root = hum and (hum.RootPart or c:FindFirstChild("HumanoidRootPart"))
+    return c, hum, root
+end
+
+local function teleportCFrame(cf)
+    local _, _, root = getChar()
+    if not root then return end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = cf
+end
+
+local function playerNames()
+    local names = {}
+    for p in pairs(Tracked) do
+        names[#names + 1] = p.Name
+    end
+    table.sort(names)
+    if #names == 0 then names[1] = "None" end
+    return names
+end
+
+local function teleportToTarget()
+    local p = Players:FindFirstChild(Settings.TPTarget)
+    if not p or not p:IsA("Player") then return end
+    local tc = p.Character
+    local troot = tc and tc:FindFirstChild("HumanoidRootPart")
+    if troot then
+        teleportCFrame(CFrame.new(troot.Position + Vector3.new(0, 3, 0)))
+    end
+end
+
+local function teleportToNearest()
+    local _, _, root = getChar()
+    if not root then return end
+    local best, bestD
+    for p in pairs(Tracked) do
+        local c = p.Character
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        local r = c and c:FindFirstChild("HumanoidRootPart")
+        if hum and hum.Health > 0 and r then
+            local d = (r.Position - root.Position).Magnitude
+            if not bestD or d < bestD then
+                best, bestD = r, d
+            end
+        end
+    end
+    if best then
+        teleportCFrame(CFrame.new(best.Position + Vector3.new(0, 3, 0)))
+    end
+end
+
+local clickParams = RaycastParams.new()
+clickParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function clickTeleport()
+    local c = LocalPlayer.Character
+    clickParams.FilterDescendantsInstances = { c, Camera }
+    local m = UserInputService:GetMouseLocation()
+    local ray = Camera:ViewportPointToRay(m.X, m.Y)
+    local hit = workspace:Raycast(ray.Origin, ray.Direction * 5000, clickParams)
+    if hit then
+        teleportCFrame(CFrame.new(hit.Position + Vector3.new(0, 3.5, 0)))
+    end
+end
+
+local flyActive = false
+local noclipParts = {}
+
+local function restoreNoclip()
+    for part in pairs(noclipParts) do
+        if part.Parent then part.CanCollide = true end
+    end
+    table.clear(noclipParts)
+end
+
+Conns[#Conns + 1] = RunService.Heartbeat:Connect(function()
+    local _, hum, root = getChar()
+
+    if Settings.Fly and hum and root and hum.Health > 0 then
+        flyActive = true
+        if not hum.PlatformStand then hum.PlatformStand = true end
+
+        local dir = Vector3.zero
+        if not UserInputService:GetFocusedTextBox() then
+            local cf = Camera.CFrame
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cf.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cf.LookVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cf.RightVector end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cf.RightVector end
+            if keyDown("BindFlyUp") then dir += Vector3.yAxis end
+            if keyDown("BindFlyDown") then dir -= Vector3.yAxis end
+        end
+
+        local speed = Settings.FlySpeed
+        if keyDown("BindFlyBoost") then speed = speed * 2 end
+
+        root.AssemblyLinearVelocity = dir.Magnitude > 0 and dir.Unit * speed or Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+
+        local look = Camera.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude > 0.01 then
+            root.CFrame = CFrame.new(root.Position, root.Position + flat)
+        end
+    elseif flyActive then
+        flyActive = false
+        if hum then hum.PlatformStand = false end
+        if root then root.AssemblyLinearVelocity = Vector3.zero end
+    end
+end)
+
+Conns[#Conns + 1] = RunService.Stepped:Connect(function()
+    if Settings.Noclip then
+        local c = LocalPlayer.Character
+        if c then
+            for _, part in ipairs(c:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    noclipParts[part] = true
+                    part.CanCollide = false
+                end
+            end
+        end
+    elseif next(noclipParts) then
+        restoreNoclip()
+    end
+end)
+
+----------------------------------------------------------------------
+-- Drawing the ESP for one entity
+----------------------------------------------------------------------
+local TracerOrigin = Vector2.new(0, 0)
+
+local function locate(char)
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return end
+    local root = hum.RootPart or char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local dist = (Camera.CFrame.Position - root.Position).Magnitude
+    if dist > Settings.MaxDistance then return end
+
+    local pos, onScreen = Camera:WorldToViewportPoint(root.Position)
+    if not onScreen then return end
+    return hum, root, dist, pos
+end
+
+local function setLine(l, ax, ay, bx, by, color)
+    l.From = Vector2.new(ax, ay)
+    l.To = Vector2.new(bx, by)
+    l.Color = color
+    l.Visible = true
+end
+
+local function draw(s, char, hum, root, dist, pos, name)
+    s.Shown = true
+
+    local rp = root.Position
+    local top = Camera:WorldToViewportPoint(rp + Vector3.new(0, 2.8, 0))
+    local bot = Camera:WorldToViewportPoint(rp - Vector3.new(0, 3.2, 0))
+    local h = math.abs(bot.Y - top.Y)
+    local w = h * 0.6
+    local x, y = pos.X - w / 2, top.Y
+    local r, b = x + w, y + h
+
+    local fill = Settings.BoxFill
+    local sh = h / FILL_N
+    for i = 1, FILL_N do
+        local sq = s.Fill[i]
+        sq.Visible = fill
+        if fill then
+            sq.Position = Vector2.new(x, y + sh * (i - 1))
+            sq.Size = Vector2.new(w, sh + 1)
+            sq.Color = grad((i - 0.5) / FILL_N)
+            sq.Transparency = Settings.FillOpacity
+        end
+    end
+
+    local used = 0
+    if Settings.Box then
+        local B = s.Box
+        if Settings.BoxStyle == "Full" then
+            setLine(B[1], x, y, r, y, C0)
+            setLine(B[2], x, b, r, b, C1)
+            for i = 1, 4 do
+                local y1, y2 = y + h * (i - 1) / 4, y + h * i / 4
+                local c = grad((i - 0.5) / 4)
+                setLine(B[2 + i], x, y1, x, y2, c)
+                setLine(B[6 + i], r, y1, r, y2, c)
+            end
+            used = 10
+        else
+            local lx, ly = w * 0.3, h * 0.2
+            local ct, cb = grad(0.1), grad(0.9)
+            setLine(B[1], x, y, x + lx, y, C0)
+            setLine(B[2], x, y, x, y + ly, ct)
+            setLine(B[3], r, y, r - lx, y, C0)
+            setLine(B[4], r, y, r, y + ly, ct)
+            setLine(B[5], x, b, x + lx, b, C1)
+            setLine(B[6], x, b, x, b - ly, cb)
+            setLine(B[7], r, b, r - lx, b, C1)
+            setLine(B[8], r, b, r, b - ly, cb)
+            used = 8
+        end
+    end
+    for i = used + 1, 10 do
+        s.Box[i].Visible = false
+    end
+
+    local ts = math.floor(Settings.TextSize + 0.5)
+
+    local nameT = s.Name
+    nameT.Visible = Settings.Name
+    if Settings.Name then
+        nameT.Text = name
+        nameT.Size = ts
+        nameT.Color = Color3.fromRGB(255, 245, 225)
+        nameT.Position = P(pos.X, y - ts - 5)
+    end
+
+    local belowY = b + 3
+    local distT = s.Dist
+    distT.Visible = Settings.Distance
+    if Settings.Distance then
+        distT.Text = string.format("[%dm]", math.floor(dist))
+        distT.Size = ts
+        distT.Color = grad(0.12)
+        distT.Position = P(pos.X, belowY)
+        belowY = belowY + ts + 2
+    end
+
+    local tool = Settings.Tool and char:FindFirstChildOfClass("Tool")
+    local toolT = s.Tool
+    toolT.Visible = tool and true or false
+    if tool then
+        toolT.Text = tool.Name
+        toolT.Size = ts
+        toolT.Color = grad(0.5)
+        toolT.Position = P(pos.X, belowY)
+    end
+
+    local showHP = Settings.Health
+    local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+    local hx = x - 6
+    s.HPBG.Visible = showHP
+    if showHP then
+        s.HPBG.From = Vector2.new(hx, b + 1)
+        s.HPBG.To = Vector2.new(hx, y - 1)
+    end
+    local segH = h / HP_N
+    for i = 1, HP_N do
+        local seg = s.HP[i]
+        local part = showHP and math.clamp(pct * HP_N - (i - 1), 0, 1) or 0
+        if part > 0 then
+            local yb = b - segH * (i - 1)
+            seg.From = Vector2.new(hx, yb)
+            seg.To = Vector2.new(hx, yb - segH * part)
+            seg.Color = grad(1 - (i - 0.5) / HP_N)
+            seg.Visible = true
+        else
+            seg.Visible = false
+        end
+    end
+
+    local hpT = s.HPText
+    hpT.Visible = showHP and Settings.HealthText
+    if hpT.Visible then
+        hpT.Text = tostring(math.floor(hum.Health))
+        hpT.Size = math.max(ts - 2, 10)
+        hpT.Color = Color3.fromRGB(255, 245, 225)
+        hpT.Position = P(hx - 6 - tw(hpT), b - h * pct - 6)
+    end
+
+    if Settings.Tracers then
+        local target = Vector2.new(pos.X, b)
+        for i = 1, TRACER_N do
+            local l = s.Tracer[i]
+            l.From = TracerOrigin:Lerp(target, (i - 1) / TRACER_N)
+            l.To = TracerOrigin:Lerp(target, i / TRACER_N)
+            l.Color = grad(0.95 - 0.9 * (i - 0.5) / TRACER_N)
+            l.Visible = true
+        end
+    else
+        for i = 1, TRACER_N do
+            s.Tracer[i].Visible = false
+        end
+    end
+
+    local head = Settings.HeadDot and char:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then
+        local hp = Camera:WorldToViewportPoint(head.Position)
+        s.Head.Position = Vector2.new(hp.X, hp.Y)
+        s.Head.Radius = math.max(h * 0.06, 2)
+        s.Head.Color = grad(0.3)
+        s.Head.Visible = true
+    else
+        s.Head.Visible = false
+    end
+end
+
+----------------------------------------------------------------------
+-- Menu definition
+----------------------------------------------------------------------
+local unloaded = false
+local unload -- forward declaration
+local flashMsg, flashUntil = "", 0
+
+local function flash(msg)
+    flashMsg, flashUntil = msg, os.clock() + 2
+end
+
+local TABS = {
+    { name = "MAIN", items = {
+        { type = "toggle", label = "ESP Enabled", key = "Enabled" },
+        { type = "toggle", label = "Team Check", key = "TeamCheck" },
+        { type = "cycle", label = "Targets", key = "Targets",
+          options = { "Players Only", "NPCs Only", "All Humanoids" } },
+        { type = "slider", label = "Max Distance", key = "MaxDistance", min = 100, max = 5000, step = 50 },
+        { type = "sep", label = "Movement" },
+        { type = "toggle", label = "Fly", key = "Fly" },
+        { type = "slider", label = "Fly Speed", key = "FlySpeed", min = 10, max = 300, step = 5 },
+        { type = "toggle", label = "Noclip", key = "Noclip" },
+        { type = "toggle", label = "Click Teleport", key = "ClickTP" },
+        { type = "cycle", label = "TP Target", key = "TPTarget", getOptions = playerNames },
+        { type = "button", label = "> Teleport To Target", action = teleportToTarget },
+        { type = "button", label = "> Teleport To Nearest", action = teleportToNearest },
+    } },
+    { name = "VISUAL", items = {
+        { type = "toggle", label = "Custom FOV", key = "FOVEnabled" },
+        { type = "slider", label = "Field Of View", key = "CameraFOV", min = 30, max = 120, step = 1 },
+        { type = "cycle", label = "FOV Method", key = "FOVMethod", options = { "Camera", "ByteNet" } },
+        { type = "button", label = "> Reset FOV To 70", action = function()
+            Settings.CameraFOV = 70
+            markDirty()
+        end },
+        { type = "sep", label = "World" },
+        { type = "toggle", label = "Fullbright", key = "Fullbright" },
+        { type = "cycle", label = "Ambient", key = "FBMode", options = { "Default", "Bright" } },
+        { type = "toggle", label = "Remove Fog", key = "FBFog" },
+        { type = "toggle", label = "Hide Sky", key = "FBSky" },
+        { type = "sep", label = "ESP" },
+        { type = "toggle", label = "Box", key = "Box" },
+        { type = "cycle", label = "Box Style", key = "BoxStyle", options = { "Corner", "Full" } },
+        { type = "toggle", label = "Box Fill", key = "BoxFill" },
+        { type = "slider", label = "Fill Opacity", key = "FillOpacity", min = 0.05, max = 0.6, step = 0.05 },
+        { type = "toggle", label = "Name", key = "Name" },
+        { type = "toggle", label = "Distance", key = "Distance" },
+        { type = "toggle", label = "Held Tool", key = "Tool" },
+        { type = "slider", label = "ESP Text Size", key = "TextSize", min = 11, max = 24, step = 1 },
+        { type = "toggle", label = "Health Bar", key = "Health" },
+        { type = "toggle", label = "Health Number", key = "HealthText" },
+        { type = "toggle", label = "Tracers", key = "Tracers" },
+        { type = "cycle", label = "Tracer Origin", key = "TracerOrigin", options = { "Bottom", "Center", "Mouse" } },
+        { type = "toggle", label = "Head Dot", key = "HeadDot" },
+    } },
+    { name = "AIM", items = {
+        { type = "toggle", label = "Aimbot", key = "AimEnabled" },
+        { type = "cycle", label = "Aim Key", key = "AimKey", options = { "Right Mouse", "Left Mouse", "Always On" } },
+        { type = "cycle", label = "Aim Part", key = "AimPart", options = { "Head", "Torso" } },
+        { type = "cycle", label = "Method", key = "AimMethod", options = { "Camera", "Mouse" } },
+        { type = "cycle", label = "FOV Center", key = "AimOrigin", options = { "Mouse", "Screen" } },
+        { type = "toggle", label = "Wall Check", key = "AimWallCheck" },
+        { type = "toggle", label = "Show FOV Circle", key = "AimShowFOV" },
+        { type = "slider", label = "FOV Radius", key = "AimFOV", min = 30, max = 600, step = 5 },
+        { type = "slider", label = "Smoothness", key = "AimSmooth", min = 1, max = 30, step = 1 },
+    } },
+    { name = "MISC", items = {
+        { type = "cycle", label = "Font", key = "Font", options = FONT_NAMES },
+        { type = "slider", label = "Menu Text Size", key = "MenuTextSize", min = 12, max = 22, step = 1 },
+        { type = "sep", label = "Keybinds" },
+        { type = "bind", label = "Menu Key", key = "BindMenu", required = true },
+        { type = "bind", label = "Unload Key", key = "BindUnload" },
+        { type = "bind", label = "Fly Key", key = "BindFly" },
+        { type = "bind", label = "Fullbright Key", key = "BindFullbright" },
+        { type = "bind", label = "Click TP Key", key = "BindClickTP", required = true },
+        { type = "bind", label = "Fly Up", key = "BindFlyUp" },
+        { type = "bind", label = "Fly Down", key = "BindFlyDown" },
+        { type = "bind", label = "Fly Boost", key = "BindFlyBoost" },
+        { type = "button", label = "> Reset Keybinds", action = function()
+            for _, k in ipairs(BIND_KEYS) do Settings[k] = Defaults[k] end
+            markDirty()
+            flash("Keybinds reset")
+        end },
+        { type = "sep", label = "Settings" },
+        { type = "button", label = "> Save Settings Now", action = function()
+            if saveSettings() then flash("Saved to SUNDOWN/settings.json") else flash("Save failed (no file access)") end
+        end },
+        { type = "button", label = "> Reset All Settings", action = function()
+            for k, v in pairs(Defaults) do
+                if not SKIP[k] then Settings[k] = v end
+            end
+            markDirty()
+            flash("Settings reset to defaults")
+        end },
+        { type = "button", label = "> Unload Script", action = function() unload() end },
+    } },
+}
+
+-- sanity-check anything loaded from disk
+for _, tab in ipairs(TABS) do
+    for _, it in ipairs(tab.items) do
+        if it.type == "slider" then
+            Settings[it.key] = math.clamp(Settings[it.key], it.min, it.max)
+        elseif it.type == "cycle" and it.options and not table.find(it.options, Settings[it.key]) then
+            Settings[it.key] = Defaults[it.key]
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- Menu UI (resizable)
+----------------------------------------------------------------------
+local HEADER, TABH, ROWH, FOOT = 32, 24, 26, 24
+local BODY_TOP = HEADER + 8 + TABH + 8
+local MIN_W, MAX_W = 440, 760
+local MIN_H, MAX_H = BODY_TOP + 4 * ROWH + FOOT, 720
+local GRIP = 16
+
+local UI = {
+    Open = true, Shown = false,
+    X = 60, Y = 120,
+    W = 520, H = BODY_TOP + 9 * ROWH + FOOT,
+    Tab = 1,
+    Drag = nil, Resize = nil, Slider = nil, Listening = nil,
+    Scroll = { 0, 0, 0, 0, 0, 0, 0, 0 },
+    ScrollT = { 0, 0, 0, 0, 0, 0, 0, 0 },
+    ZoomLock = false, HaveZoom = false, LockedZoom = 8,
+}
+
+if savedUI then
+    local vp = Camera.ViewportSize
+    UI.W = math.clamp(tonumber(savedUI.W) or UI.W, MIN_W, MAX_W)
+    UI.H = math.clamp(tonumber(savedUI.H) or UI.H, MIN_H, MAX_H)
+    UI.X = math.clamp(tonumber(savedUI.X) or UI.X, 0, math.max(vp.X - UI.W, 0))
+    UI.Y = math.clamp(tonumber(savedUI.Y) or UI.Y, 0, math.max(vp.Y - UI.H, 0))
+    UI.Tab = math.clamp(math.floor(tonumber(savedUI.Tab) or 1), 1, #TABS)
+end
+
+saveSettings = function()
+    if not ensureFolder() then return false end
+    local ok = pcall(function()
+        local out = {}
+        for k, v in pairs(Settings) do
+            if not SKIP[k] then out[k] = v end
+        end
+        out.__ui = { X = UI.X, Y = UI.Y, W = UI.W, H = UI.H, Tab = UI.Tab }
+        writefile(FILE, HttpService:JSONEncode(out))
+    end)
+    return ok
+end
+
+local TEXT_WHITE = Color3.fromRGB(255, 250, 255)
+local UIAll = {}
+local UITexts = {}
+
+local function uiNew(class, props, z, pool)
+    local d = Drawing.new(class)
+    if class == "Text" then
+        styleText(d)
+        UITexts[#UITexts + 1] = d
+    end
+    for k, v in pairs(props) do
+        d[k] = v
+    end
+    d.ZIndex = 100 + (z or 0)
+    d.Visible = false
+    UIAll[#UIAll + 1] = d
+    if pool then pool[#pool + 1] = d end
+    return d
+end
+
+local uiBorder = uiNew("Square", { Filled = false, Thickness = 1, Color = grad(0.5), Transparency = 1 }, 8)
+
+local BG_N = 14
+local bgStrips = {}
+for i = 1, BG_N do
+    local t = (i - 1) / (BG_N - 1)
+    bgStrips[i] = uiNew("Square", {
+        Filled = true,
+        Color = Color3.fromRGB(28, 10, 56):Lerp(Color3.fromRGB(6, 4, 18), t),
+        Transparency = 0.97,
+    }, 0)
+end
+
+local HEAD_N = 40
+local headStrips, glowStrips = {}, {}
+for i = 1, HEAD_N do
+    headStrips[i] = uiNew("Square", { Filled = true, Transparency = 1 }, 1)
+    glowStrips[i] = uiNew("Square", { Filled = true, Transparency = 0.9 }, 2)
+end
+
+local uiTitle = uiNew("Text", {
+    Text = "S U N D O W N", Size = 19, Center = true, Color = Color3.fromRGB(255, 255, 255),
+}, 4)
+local uiFoot = uiNew("Text", {
+    Text = "", Size = 13, Center = true, Color = grad(0.6),
+}, 4)
+
+local gripLines = {}
+for i = 1, 3 do
+    gripLines[i] = uiNew("Line", { Thickness = 1, Transparency = 1 }, 5)
+end
+
+local sbTrack = uiNew("Square", { Filled = true, Color = Color3.fromRGB(52, 26, 92), Transparency = 0.8 }, 4)
+local sbThumb = uiNew("Square", { Filled = true, Transparency = 1 }, 5)
+
+local tabBG, tabTxt = {}, {}
+for i, t in ipairs(TABS) do
+    tabBG[i] = uiNew("Square", { Filled = true, Transparency = 1 }, 2)
+    tabTxt[i] = uiNew("Text", { Text = t.name, Size = 13, Center = true, Color = TEXT_WHITE }, 3)
+end
+
+local SLIDER_STRIPS = 10
+local Widgets = {}
+for ti, tab in ipairs(TABS) do
+    for ri, item in ipairs(tab.items) do
+        local w = { item = item, tab = ti, row = ri, all = {}, Shown = false }
+        w.Hover = uiNew("Square", { Filled = true, Color = Color3.fromRGB(150, 60, 200), Transparency = 0.3 }, 1, w.all)
+        w.Label = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
+
+        if item.type == "toggle" then
+            w.Box = uiNew("Square", { Filled = false, Thickness = 1, Color = grad(0.5), Transparency = 1 }, 3, w.all)
+            w.Check = uiNew("Square", { Filled = true, Color = grad(0.1), Transparency = 1 }, 4, w.all)
+        elseif item.type == "cycle" or item.type == "bind" then
+            w.Value = uiNew("Text", { Size = 16 }, 3, w.all)
+        elseif item.type == "slider" then
+            w.Track = uiNew("Square", { Filled = true, Color = Color3.fromRGB(52, 26, 92), Transparency = 1 }, 2, w.all)
+            w.Strips = {}
+            for i = 1, SLIDER_STRIPS do
+                w.Strips[i] = uiNew("Square", { Filled = true, Transparency = 1 }, 3, w.all)
+            end
+            w.Value = uiNew("Text", { Size = 16, Color = TEXT_WHITE }, 3, w.all)
+        elseif item.type == "sep" then
+            w.SepText = uiNew("Text", { Size = 12, Center = true }, 3, w.all)
+        end
+        Widgets[#Widgets + 1] = w
+    end
+end
+
+local function inRect(m, x, y, w, h)
+    return m.X >= x and m.X <= x + w and m.Y >= y and m.Y <= y + h
+end
+
+local function visRows()
+    return math.max(1, math.floor((UI.H - BODY_TOP - FOOT) / ROWH))
+end
+
+local function maxScroll(tab)
+    return math.max(0, #TABS[tab].items - visRows())
+end
+
+local function rowVisible(w)
+    local r = w.row - UI.Scroll[w.tab]
+    return r >= 1 and r <= visRows()
+end
+
+local function rowRect(w)
+    local r = w.row - UI.Scroll[w.tab]
+    return UI.X + 6, UI.Y + BODY_TOP + (r - 1) * ROWH, UI.W - 16
+end
+
+local function sliderGeom(rx, rw)
+    local ts = Settings.MenuTextSize
+    local labW = math.floor(ts * 10)
+    local valW = math.floor(ts * 4)
+    return rx + labW, math.max(rw - labW - valW, 20)
+end
+
+local function applySlider(w, mx)
+    local it = w.item
+    local rx, _, rw = rowRect(w)
+    local trackX, trackW = sliderGeom(rx, rw)
+    local t = math.clamp((mx - trackX) / trackW, 0, 1)
+    local v = it.min + t * (it.max - it.min)
+    v = math.floor(v / it.step + 0.5) * it.step
+    v = math.clamp(v, it.min, it.max)
+    if Settings[it.key] ~= v then
+        Settings[it.key] = v
+        if it.onChange then it.onChange(v) end
+    end
+end
+
+local appliedFont
+
+local function applyFontEverywhere()
+    local id = fontId()
+    appliedFont = Settings.Font
+    for _, d in ipairs(UITexts) do
+        pcall(function() d.Font = id end)
+    end
+    for _, s in pairs(Sets) do
+        for _, d in ipairs({ s.Name, s.Dist, s.Tool, s.HPText }) do
+            pcall(function() d.Font = id end)
+        end
+    end
+end
+
+local function footerText()
+    return string.format("%s menu   %s unload   %s fly",
+        keyLabel(Settings.BindMenu), keyLabel(Settings.BindUnload), keyLabel(Settings.BindFly))
+end
+
+local function getZoomDistance()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root and Camera then
+        return (Camera.CFrame.Position - root.Position).Magnitude
+    end
+    return nil
+end
+
+local function renderUI(dt)
+    if not UI.Open then
+        if UI.Shown then
+            for _, d in ipairs(UIAll) do d.Visible = false end
+            for _, w in ipairs(Widgets) do w.Shown = false end
+            UI.Shown = false
+        end
+        UI.Drag, UI.Resize, UI.Slider, UI.Listening = nil, nil, nil, nil
+        return
+    end
+    UI.Shown = true
+
+    if appliedFont ~= Settings.Font then applyFontEverywhere() end
+
+    local m = UserInputService:GetMouseLocation()
+    local vp = Camera.ViewportSize
+    local clock = os.clock()
+    local ts = math.floor(Settings.MenuTextSize + 0.5)
+
+    if UI.Resize then
+        UI.W = math.floor(math.clamp(UI.Resize.W + (m.X - UI.Resize.MX), MIN_W, math.min(MAX_W, math.max(vp.X - UI.X, MIN_W))))
+        UI.H = math.floor(math.clamp(UI.Resize.H + (m.Y - UI.Resize.MY), MIN_H, math.min(MAX_H, math.max(vp.Y - UI.Y, MIN_H))))
+    elseif UI.Drag then
+        UI.X = math.floor(math.clamp(m.X - UI.Drag.X, 0, math.max(vp.X - UI.W, 0)))
+        UI.Y = math.floor(math.clamp(m.Y - UI.Drag.Y, 0, math.max(vp.Y - UI.H, 0)))
+    end
+    if UI.Slider then
+        applySlider(UI.Slider, m.X)
+    end
+
+    -- smooth scroll: ease Scroll toward ScrollT every frame
+    for i = 1, #TABS do
+        UI.ScrollT[i] = math.clamp(UI.ScrollT[i], 0, maxScroll(i))
+        local target = UI.ScrollT[i]
+        local nextS = UI.Scroll[i] + (target - UI.Scroll[i]) * (1 - math.exp(-(dt or 0.016) * 14))
+        if math.abs(target - nextS) < 0.005 then nextS = target end
+        UI.Scroll[i] = nextS
+    end
+
+    local X, Y, W, H = UI.X, UI.Y, UI.W, UI.H
+
+-- lock camera zoom while the mouse is over the menu (prevents Roblox zoom-out on wheel)
+    local mouseOverMenu = inRect(m, X, Y, W, H)
+    if mouseOverMenu and not UI.ZoomLock then
+        if not UI.HaveZoom then
+            local zd = getZoomDistance()
+            if zd then
+                UI.LockedZoom = zd
+                UI.HaveZoom = true
+            end
+        end
+        if UI.HaveZoom then
+            UI.ZoomLock = true
+            UI.OrigMinZoom = LocalPlayer.CameraMinZoomDistance
+            UI.OrigMaxZoom = LocalPlayer.CameraMaxZoomDistance
+            LocalPlayer.CameraMinZoomDistance = UI.LockedZoom
+            LocalPlayer.CameraMaxZoomDistance = UI.LockedZoom
+        end
+    elseif not mouseOverMenu and UI.ZoomLock then
+        UI.ZoomLock = false
+        pcall(function()
+            LocalPlayer.CameraMinZoomDistance = UI.OrigMinZoom
+            LocalPlayer.CameraMaxZoomDistance = UI.OrigMaxZoom
+        end)
+    end
+
+    uiBorder.Position, uiBorder.Size, uiBorder.Visible = Vector2.new(X, Y), Vector2.new(W, H), true
+    uiBorder.Color = gradAnim(0.5, clock * 0.08)
+
+    local bodyH = H - HEADER
+    local bh = bodyH / BG_N
+    for i, st in ipairs(bgStrips) do
+        st.Position = Vector2.new(X, Y + HEADER + bh * (i - 1))
+        st.Size = Vector2.new(W, bh + 1)
+        st.Visible = true
+    end
+
+    local sw = W / HEAD_N
+    local drift = clock * 0.06
+    for i = 1, HEAD_N do
+        local t = (i - 1) / (HEAD_N - 1)
+        local hs, gs = headStrips[i], glowStrips[i]
+        hs.Position = Vector2.new(X + sw * (i - 1), Y)
+        hs.Size = Vector2.new(sw + 1, HEADER)
+        hs.Color = gradAnim(t * 0.9, drift)
+        hs.Visible = true
+        gs.Position = Vector2.new(X + sw * (i - 1), Y + HEADER)
+        gs.Size = Vector2.new(sw + 1, 3)
+        gs.Color = gradAnim(t * 0.9, drift)
+        gs.Visible = true
+    end
+
+    uiTitle.Size = ts + 3
+    uiTitle.Position = P(X + W / 2, Y + (HEADER - (ts + 3)) / 2 - 1)
+    uiTitle.Visible = true
+
+    if UI.Listening then
+        uiFoot.Text = "Press a key  (Esc = cancel, Backspace = clear)"
+    elseif clock < flashUntil then
+        uiFoot.Text = flashMsg
+    else
+        uiFoot.Text = footerText()
+    end
+    uiFoot.Size = math.max(ts - 3, 10)
+    uiFoot.Position = P(X + W / 2, Y + H - FOOT + 4)
+    uiFoot.Color = gradAnim(0.6, drift)
+    uiFoot.Visible = true
+
+    for i, l in ipairs(gripLines) do
+        local o = i * 4
+        l.From = Vector2.new(X + W - 2, Y + H - 2 - o)
+        l.To = Vector2.new(X + W - 2 - o, Y + H - 2)
+        l.Color = grad(0.35 + i * 0.15)
+        l.Visible = true
+    end
+
+    local tabW = (W - 12) / #TABS
+    -- shrink tab labels if they would not fit (longest name is 6 characters)
+    local tabSize = math.clamp(math.floor((tabW - 10) / (6 * 0.6)), 9, math.max(ts - 3, 10))
+    for i = 1, #TABS do
+        local bgd, tx = tabBG[i], tabTxt[i]
+        local tx0 = X + 6 + (i - 1) * tabW
+        bgd.Position = Vector2.new(tx0, Y + HEADER + 8)
+        bgd.Size = Vector2.new(tabW - 4, TABH)
+        bgd.Visible = true
+        tx.Size = tabSize
+        tx.Position = P(tx0 + (tabW - 4) / 2, Y + HEADER + 8 + (TABH - tabSize) / 2 - 1)
+        tx.Visible = true
+        if i == UI.Tab then
+            bgd.Color = gradAnim(0.15 + 0.7 * (i - 1) / #TABS, drift)
+        else
+            bgd.Color = Color3.fromRGB(44, 20, 78)
+        end
+    end
+
+    local rows = visRows()
+    local total = #TABS[UI.Tab].items
+    if total > rows then
+        local trackH = rows * ROWH - 2
+        local thumbH = math.max(trackH * rows / total, 14)
+        local frac = UI.Scroll[UI.Tab] / math.max(total - rows, 1)
+        sbTrack.Position = Vector2.new(X + W - 7, Y + BODY_TOP)
+        sbTrack.Size = Vector2.new(3, trackH)
+        sbTrack.Visible = true
+        sbThumb.Position = Vector2.new(X + W - 7, Y + BODY_TOP + (trackH - thumbH) * frac)
+        sbThumb.Size = Vector2.new(3, thumbH)
+        sbThumb.Color = gradAnim(0.4, drift)
+        sbThumb.Visible = true
+    else
+        sbTrack.Visible = false
+        sbThumb.Visible = false
+    end
+
+    local textY = (ROWH - ts) / 2 - 1
+
+    for _, w in ipairs(Widgets) do
+        local it = w.item
+        if w.tab ~= UI.Tab or not rowVisible(w) then
+            if w.Shown then
+                for _, d in ipairs(w.all) do d.Visible = false end
+                w.Shown = false
+            end
+        else
+            w.Shown = true
+            local rx, ry, rw = rowRect(w)
+            local val = it.key and Settings[it.key]
+
+            w.Hover.Position = Vector2.new(rx, ry)
+            w.Hover.Size = Vector2.new(rw, ROWH - 2)
+            w.Hover.Visible = inRect(m, rx, ry, rw, ROWH) and not UI.Resize and not UI.Drag
+
+            w.Label.Text = it.label
+            w.Label.Size = ts
+            w.Label.Visible = true
+
+            if it.type == "toggle" then
+                w.Label.Position = P(rx + 30, ry + textY)
+                w.Box.Position = Vector2.new(rx + 7, ry + 4)
+                w.Box.Size = Vector2.new(16, 16)
+                w.Box.Visible = true
+                w.Check.Position = Vector2.new(rx + 10, ry + 7)
+                w.Check.Size = Vector2.new(10, 10)
+                w.Check.Visible = val and true or false
+            elseif it.type == "cycle" then
+                w.Label.Position = P(rx + 8, ry + textY)
+                w.Value.Text = "[" .. tostring(val) .. "]"
+                w.Value.Size = ts
+                w.Value.Color = grad(0.12)
+                w.Value.Position = P(rx + rw - 8 - tw(w.Value), ry + textY)
+                w.Value.Visible = true
+            elseif it.type == "bind" then
+                w.Label.Position = P(rx + 8, ry + textY)
+                if UI.Listening == w then
+                    w.Value.Text = "[press a key...]"
+                    w.Value.Color = gradAnim(0.0, clock * 0.8)
+                else
+                    w.Value.Text = "[" .. keyLabel(val) .. "]"
+                    w.Value.Color = grad(0.12)
+                end
+                w.Value.Size = ts
+                w.Value.Position = P(rx + rw - 8 - tw(w.Value), ry + textY)
+                w.Value.Visible = true
+            elseif it.type == "button" then
+                w.Label.Position = P(rx + 8, ry + textY)
+                w.Label.Color = gradAnim(0.12, drift)
+            elseif it.type == "sep" then
+                w.Hover.Visible = false
+                w.SepText.Text = "── " .. string.upper(it.label) .. " ──"
+                w.SepText.Size = math.max(ts - 4, 10)
+                w.SepText.Position = P(rx + rw / 2, ry + (ROWH - w.SepText.Size) / 2)
+                w.SepText.Color = gradAnim(0.5, drift)
+                w.SepText.Visible = true
+            else -- slider
+                w.Label.Position = P(rx + 8, ry + textY)
+                local trackX, trackW = sliderGeom(rx, rw)
+                w.Track.Position = Vector2.new(trackX, ry + 9)
+                w.Track.Size = Vector2.new(trackW, 6)
+                w.Track.Visible = true
+
+                local ratio = math.clamp((val - it.min) / (it.max - it.min), 0, 1)
+                local fillW = trackW * ratio
+                local n = #w.Strips
+                local segW = trackW / n
+                for i, st in ipairs(w.Strips) do
+                    local pw = math.clamp(fillW - (i - 1) * segW, 0, segW)
+                    if pw > 0.5 then
+                        st.Position = Vector2.new(trackX + (i - 1) * segW, ry + 9)
+                        st.Size = Vector2.new(pw + (pw >= segW and 1 or 0), 6)
+                        st.Color = grad(0.05 + 0.85 * (i - 0.5) / n)
+                        st.Visible = true
+                    else
+                        st.Visible = false
+                    end
+                end
+
+                w.Value.Text = it.step < 1 and string.format("%.2f", val) or tostring(math.floor(val + 0.5))
+                w.Value.Size = ts
+                w.Value.Position = P(rx + rw - 6 - tw(w.Value), ry + textY)
+                w.Value.Visible = true
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- Aimbot
+----------------------------------------------------------------------
+local AimAll = {}
+local function aimNew(class, props)
+    local d = Drawing.new(class)
+    for k, v in pairs(props) do d[k] = v end
+    d.ZIndex = 50
+    d.Visible = false
+    AimAll[#AimAll + 1] = d
+    return d
+end
+
+local fovCircle = aimNew("Circle", { Filled = false, Thickness = 1.5, NumSides = 64, Transparency = 1 })
+local lockLine = aimNew("Line", { Thickness = 1.5, Transparency = 0.9 })
+local lockDot = aimNew("Circle", { Filled = true, Radius = 3, NumSides = 12, Transparency = 1 })
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function aimKeyDown()
+    local k = Settings.AimKey
+    if k == "Always On" then return true end
+    if k == "Left Mouse" then
+        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    end
+    return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+end
+
+local function getAimPart(char, root)
+    local part
+    if Settings.AimPart == "Head" then
+        part = char:FindFirstChild("Head")
+    else
+        part = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+    end
+    return part or root
+end
+
+local function hasLineOfSight(part, char)
+    local myChar = LocalPlayer.Character
+    rayParams.FilterDescendantsInstances = { myChar, char, Camera }
+    local origin = Camera.CFrame.Position
+    return workspace:Raycast(origin, part.Position - origin, rayParams) == nil
+end
+
+local function consider(char, origin, best)
+    if not char then return best end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return best end
+    local root = hum.RootPart or char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+    if not root then return best end
+
+    local part = getAimPart(char, root)
+    if (Camera.CFrame.Position - part.Position).Magnitude > Settings.MaxDistance then return best end
+
+    local sp, onScreen = Camera:WorldToViewportPoint(part.Position)
+    if not onScreen then return best end
+
+    local d = (Vector2.new(sp.X, sp.Y) - origin).Magnitude
+    if d > Settings.AimFOV or (best and d >= best.dist) then return best end
+
+    if Settings.AimWallCheck and not hasLineOfSight(part, char) then return best end
+
+    return { dist = d, part = part, screen = Vector2.new(sp.X, sp.Y) }
+end
+
+local function aimStep(dt)
+    if unloaded then return end
+    Camera = workspace.CurrentCamera
+
+    -- runs right after the game's camera script, so FOV easing wins over resets
+    fovStep(dt)
+
+    local mouse = UserInputService:GetMouseLocation()
+    local origin = mouse
+    if Settings.AimOrigin == "Screen" then
+        origin = Camera.ViewportSize / 2
+    end
+
+    local active = Settings.AimEnabled
+
+    fovCircle.Visible = active and Settings.AimShowFOV
+    if fovCircle.Visible then
+        fovCircle.Position = origin
+        fovCircle.Radius = Settings.AimFOV
+        fovCircle.Color = gradAnim(0.3, os.clock() * 0.1)
+    end
+
+    lockLine.Visible = false
+    lockDot.Visible = false
+
+    if not active or not aimKeyDown() then return end
+    if UI.Open and inRect(mouse, UI.X, UI.Y, UI.W, UI.H) then return end
+
+    local best
+    local myChar = LocalPlayer.Character
+
+    if Settings.Targets ~= "NPCs Only" then
+        for player in pairs(Tracked) do
+            local blocked = Settings.TeamCheck and player.Team ~= nil and player.Team == LocalPlayer.Team
+            if not blocked then
+                best = consider(player.Character, origin, best)
+            end
+        end
+    end
+    if Settings.Targets ~= "Players Only" then
+        for model in pairs(NPCModels) do
+            if model.Parent and model ~= myChar and not Players:GetPlayerFromCharacter(model) then
+                best = consider(model, origin, best)
+            end
+        end
+    end
+
+    if not best then return end
+
+    local alpha = 1 / math.max(Settings.AimSmooth, 1)
+
+    if Settings.AimMethod == "Mouse" and mousemoverel then
+        mousemoverel((best.screen.X - mouse.X) * alpha, (best.screen.Y - mouse.Y) * alpha)
+    else
+        local camPos = Camera.CFrame.Position
+        local goal = CFrame.lookAt(camPos, best.part.Position)
+        Camera.CFrame = Camera.CFrame:Lerp(goal, alpha)
+    end
+
+    lockLine.From = origin
+    lockLine.To = best.screen
+    lockLine.Color = grad(0.48)
+    lockLine.Visible = true
+    lockDot.Position = best.screen
+    lockDot.Color = grad(0.05)
+    lockDot.Visible = true
+end
+
+RunService:BindToRenderStep("SundownAim", Enum.RenderPriority.Camera.Value + 1, aimStep)
+
+----------------------------------------------------------------------
+-- Input
+----------------------------------------------------------------------
+unload = function()
+    if unloaded then return end
+
+    saveSettings() -- save first, so fullbright / FOV / etc. come back next time
+
+    -- undo everything that touched the game
+    Settings.Fullbright = false
+    fullbrightStep()
+
+    Settings.FOVEnabled = false
+    if fovState.active then
+        workspace.CurrentCamera.FieldOfView = fovState.orig
+        fovState.active = false
+    end
+    if lastFOV and lastFOV ~= 70 then
+        sendFOV(70, true)
+    end
+
+    Settings.Fly = false
+    local _, hum, root = getChar()
+    if hum then hum.PlatformStand = false end
+    if root then root.AssemblyLinearVelocity = Vector3.zero end
+    restoreNoclip()
+
+    unloaded = true
+    pcall(function() RunService:UnbindFromRenderStep("SundownAim") end)
+    for _, c in ipairs(Conns) do
+        c:Disconnect()
+    end
+    for key in pairs(Sets) do
+        release(key)
+    end
+    for _, d in ipairs(UIAll) do
+        d:Remove()
+    end
+    for _, d in ipairs(AimAll) do
+        d:Remove()
+    end
+    getgenv().UnloadESP = nil
+    getgenv().ESPSettings = nil
+end
+
+Conns[#Conns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        -- rebinding: the next key pressed becomes the new bind
+        if UI.Listening then
+            local it = UI.Listening.item
+            local kc = input.KeyCode
+            if kc == Enum.KeyCode.Escape then
+                -- cancel, keep the old key
+            elseif kc == Enum.KeyCode.Backspace or kc == Enum.KeyCode.Delete then
+                Settings[it.key] = it.required and Defaults[it.key] or "None"
+                markDirty()
+            elseif kc ~= Enum.KeyCode.Unknown then
+                Settings[it.key] = kc.Name
+                markDirty()
+            end
+            UI.Listening = nil
+            return
+        end
+
+        if gp then return end
+
+        if pressed(input, "BindMenu") then
+            UI.Open = not UI.Open
+        elseif pressed(input, "BindUnload") then
+            unload()
+        elseif pressed(input, "BindFly") then
+            Settings.Fly = not Settings.Fly
+        elseif pressed(input, "BindFullbright") then
+            Settings.Fullbright = not Settings.Fullbright
+            markDirty()
+        end
+        return
+    end
+
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    local m = UserInputService:GetMouseLocation()
+
+    -- hold the Click TP key + click to teleport (not when clicking on the menu)
+    if Settings.ClickTP and keyDown("BindClickTP")
+        and not (UI.Open and inRect(m, UI.X, UI.Y, UI.W, UI.H)) then
+        clickTeleport()
+        return
+    end
+
+    if not UI.Open then return end
+
+    UI.Listening = nil
+
+    if inRect(m, UI.X + UI.W - GRIP, UI.Y + UI.H - GRIP, GRIP, GRIP) then
+        UI.Resize = { MX = m.X, MY = m.Y, W = UI.W, H = UI.H }
+        return
+    end
+
+    if inRect(m, UI.X, UI.Y, UI.W, HEADER) then
+        UI.Drag = Vector2.new(m.X - UI.X, m.Y - UI.Y)
+        return
+    end
+
+    local tabW = (UI.W - 12) / #TABS
+    for i = 1, #TABS do
+        if inRect(m, UI.X + 6 + (i - 1) * tabW, UI.Y + HEADER + 8, tabW - 4, TABH) then
+            UI.Tab = i
+            markDirty()
+            return
+        end
+    end
+
+    for _, w in ipairs(Widgets) do
+        if w.tab == UI.Tab and rowVisible(w) then
+            local rx, ry, rw = rowRect(w)
+            if inRect(m, rx, ry, rw, ROWH) then
+                local it = w.item
+                if it.type == "sep" then
+                    return
+                elseif it.type == "toggle" then
+                    Settings[it.key] = not Settings[it.key]
+                    markDirty()
+                elseif it.type == "cycle" then
+                    local opts = it.getOptions and it.getOptions() or it.options
+                    local idx = table.find(opts, Settings[it.key]) or 0
+                    Settings[it.key] = opts[idx % #opts + 1]
+                    markDirty()
+                elseif it.type == "bind" then
+                    UI.Listening = w
+                elseif it.type == "button" then
+                    it.action()
+                else
+                    UI.Slider = w
+                    applySlider(w, m.X)
+                end
+                return
+            end
+        end
+    end
+end)
+
+Conns[#Conns + 1] = UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if UI.Drag or UI.Resize or UI.Slider then
+            markDirty()
+        end
+        UI.Drag, UI.Resize, UI.Slider = nil, nil, nil
+    end
+end)
+
+Conns[#Conns + 1] = UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseWheel then
+        local m = UserInputService:GetMouseLocation()
+        if UI.Open and inRect(m, UI.X, UI.Y, UI.W, UI.H) then
+            UI.ScrollT[UI.Tab] = math.clamp(UI.ScrollT[UI.Tab] - input.Position.Z, 0, maxScroll(UI.Tab))
+        else
+            -- player zoomed the camera: re-capture the new distance for the next hover
+            UI.HaveZoom = false
+            UI.ZoomLock = false
+        end
+    end
+end)
+
+----------------------------------------------------------------------
+-- Main loop
+----------------------------------------------------------------------
+local npcActive = false
+
+local function computeOrigin()
+    local vp = Camera.ViewportSize
+    local o = Settings.TracerOrigin
+    if o == "Center" then
+        return Vector2.new(vp.X / 2, vp.Y / 2)
+    elseif o == "Mouse" then
+        return UserInputService:GetMouseLocation()
+    end
+    return Vector2.new(vp.X / 2, vp.Y)
+end
+
+Conns[#Conns + 1] = RunService.RenderStepped:Connect(function(dt)
+    Camera = workspace.CurrentCamera
+    renderUI(dt)
+    fullbrightStep()
+
+    -- debounced auto-save (1s after the last change, never while dragging)
+    if dirtyAt and not (UI.Drag or UI.Resize or UI.Slider) and os.clock() - dirtyAt > 1 then
+        dirtyAt = nil
+        saveSettings()
+    end
+
+    if not Settings.Enabled then
+        for _, s in pairs(Sets) do
+            hideSet(s)
+        end
+        return
+    end
+
+    if Settings.Tracers then
+        TracerOrigin = computeOrigin()
+    end
+
+    local showPlayers = Settings.Targets ~= "NPCs Only"
+    local showNPCs = Settings.Targets ~= "Players Only"
+
+    if showPlayers then
+        for player in pairs(Tracked) do
+            local char = player.Character
+            local hum, root, dist, pos = locate(char)
+            local s = Sets[player]
+            local blocked = Settings.TeamCheck and player.Team ~= nil and player.Team == LocalPlayer.Team
+            if hum and not blocked then
+                s = s or acquire(player)
+                draw(s, char, hum, root, dist, pos, player.DisplayName)
+            elseif s then
+                hideSet(s)
+            end
+        end
+    else
+        for player in pairs(Tracked) do
+            local s = Sets[player]
+            if s then hideSet(s) end
+        end
+    end
+
+    if showNPCs then
+        npcActive = true
+        local myChar = LocalPlayer.Character
+        for model in pairs(NPCModels) do
+            if not model.Parent then
+                NPCModels[model] = nil
+                release(model)
+            elseif model ~= myChar and not Players:GetPlayerFromCharacter(model) then
+                local hum, root, dist, pos = locate(model)
+                local s = Sets[model]
+                if hum then
+                    s = s or acquire(model)
+                    draw(s, model, hum, root, dist, pos, model.Name)
+                elseif s then
+                    hideSet(s)
+                end
+            end
+        end
+    elseif npcActive then
+        npcActive = false
+        for model in pairs(NPCModels) do
+            release(model)
+        end
+    end
+end)
+
+getgenv().ESPSettings = Settings
+getgenv().UnloadESP = unload
+
+-- create the SUNDOWN folder + first settings file right away
+saveSettings()
+
+return Settings
